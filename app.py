@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify
 from flask.helpers import send_file
 import numpy as np
 import onnxruntime
-
 import cv2
 import json
 
@@ -10,23 +9,23 @@ app = Flask(__name__,
             static_url_path='/', 
             static_folder='web')
 
-ort_session = onnxruntime.InferenceSession("efficientnet-lite4-11.onnx")
 
-# load the labels text file
+session_large = onnxruntime.InferenceSession("efficientnet-lite4-11.onnx")
+session_small = onnxruntime.InferenceSession("efficientnet-lite4-11-int8.onnx")
+
+
 labels = json.load(open("labels_map.txt", "r"))
 
-# set image file dimensions to 224x224 by resizing and cropping image from center
+
 def pre_process_edgetpu(img, dims):
     output_height, output_width, _ = dims
     img = resize_with_aspectratio(img, output_height, output_width, inter_pol=cv2.INTER_LINEAR)
     img = center_crop(img, output_height, output_width)
     img = np.asarray(img, dtype='float32')
-    # converts jpg pixel value from [0 - 255] to float array [-1.0 - 1.0]
     img -= [127.0, 127.0, 127.0]
     img /= [128.0, 128.0, 128.0]
     return img
 
-# resize the image with a proportional scale
 def resize_with_aspectratio(img, out_height, out_width, scale=87.5, inter_pol=cv2.INTER_LINEAR):
     height, width, _ = img.shape
     new_height = int(100. * out_height / scale)
@@ -40,7 +39,6 @@ def resize_with_aspectratio(img, out_height, out_width, scale=87.5, inter_pol=cv
     img = cv2.resize(img, (w, h), interpolation=inter_pol)
     return img
 
-# crop the image around the center based on given height and width
 def center_crop(img, out_height, out_width):
     height, width, _ = img.shape
     left = int((width - out_width) / 2)
@@ -52,33 +50,29 @@ def center_crop(img, out_height, out_width):
 
 @app.route("/")
 def indexPage():
-    # Haven't used the secure way to send files yet
     return send_file("web/index.html")    
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-
-    # read the image
+    # Bild laden
     content = request.files.get('0', '').read()
-
-    # build numpy array from uploaded data
-    img = cv2.imdecode(np.fromstring(content, np.uint8), cv2.IMREAD_UNCHANGED)
-
-    # pre-process, see https://github.com/onnx/models/tree/master/vision/classification/efficientnet-lite4
+    img = cv2.imdecode(np.frombuffer(content, np.uint8), cv2.IMREAD_UNCHANGED)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # pre-process the image like mobilenet and resize it to 224x224
     img = pre_process_edgetpu(img, (224, 224, 3))
-
-    # create a batch of 1 (that batch size is buned into the saved_model)
     img_batch = np.expand_dims(img, axis=0)
 
-    # run inference
-    results = ort_session.run(["Softmax:0"], {"images:0": img_batch})[0]
-    result = reversed(results[0].argsort()[-5:])
+    results_large = session_large.run(["Softmax:0"], {"images:0": img_batch})[0]
+    top_large = reversed(results_large[0].argsort()[-5:])
+    result_list_large = [{"class": labels[str(r)], "value": float(results_large[0][r])} for r in top_large]
 
-    for r in result:
-        result_list = [{"class": labels[str(r)], "value": float(results[0][r])} for r in result]
+    results_small = session_small.run(["Softmax:0"], {"images:0": img_batch})[0]
+    top_small = reversed(results_small[0].argsort()[-5:])
+    result_list_small = [{"class": labels[str(r)], "value": float(results_small[0][r])} for r in top_small]
 
-    # Return the result as JSON
-    return jsonify(result_list)    
+  
+    return jsonify({
+        "original_model": result_list_large,
+        "lite_model": result_list_small
+    })
+if __name__ == "__main__":
+    app.run(debug=True)
